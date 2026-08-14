@@ -31,6 +31,7 @@ class Product(Base):
     color = Column(String)
     image_url = Column(String)
     material = Column(String)
+    country = Column(String)
     image_url= Column(String)
     description = Column(Text)
     is_available = Column(Boolean, default=True)

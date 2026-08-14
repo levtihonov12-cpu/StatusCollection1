@@ -19,6 +19,7 @@ class Product(BaseModel):
     color: Optional[str] = None
     image_url: Optional[str] = None
     material: Optional[str] = None
+    country: Optional[str] = None
     description: Optional[str] = None
     is_available: bool
 
@@ -83,6 +84,7 @@ class ProductCreate(BaseModel):
     price: int
     color: Optional[str] = None
     material: Optional[str] = None
+    country: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
     is_available: bool = True
