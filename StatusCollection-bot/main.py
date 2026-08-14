@@ -20,6 +20,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 from admin_handlers import router as admin_router
+
 dp.include_router(admin_router)
 dp.include_router(main_router)
 
@@ -29,6 +30,7 @@ RUSSIAN_STATUSES = {
     "completed": "Завершён",
     "cancelled": "Отменён",
 }
+
 
 class UserBasket:
     _baskets = {}
@@ -55,6 +57,11 @@ class CheckoutSteps(StatesGroup):
     step_name = State()
     step_phone = State()
     step_address = State()
+
+
+class ReviewSteps(StatesGroup):
+    step_comment = State()
+    step_rating = State()
 
 
 async def generate_cart_summary(user_id: int) -> tuple[str, int]:
@@ -85,6 +92,7 @@ def make_product_card(prod: dict) -> str:
         f"💰 Стоимость: {prod['price']} ₽\n"
         f"🎨 Цвет: {prod.get('color', 'не указан')}\n"
         f"🧵 Материал: {prod.get('material', 'не указан')}\n\n"
+        f"🌍 Страна производитель: {prod.get('country','не указан')}\n"
         f"📝 {prod.get('description') or 'Описание к этому товару отсутствует.'}"
     )
 
@@ -109,8 +117,8 @@ async def handle_start(msg: Message):
 
 
 @main_router.message(Command("cancel"))
-async def handle_cancel(msg: Message, fsm: FSMContext):
-    await fsm.clear()
+async def handle_cancel(msg: Message, state: FSMContext):
+    await state.clear()
     await msg.answer("Все текущие действия сброшены.", reply_markup=kb.get_main_reply_kb())
 
 
@@ -154,10 +162,19 @@ async def show_user_orders(msg: Message):
             f"Статус: {st}\n"
             f"К оплате: {order['total_price']} ₽\n"
             f"Позиций в заказе: {len(order['items'])}\n"
-            f"{'-'*20}"
+            f"{'-' * 20}"
         )
 
     await msg.answer("\n".join(output))
+
+
+@main_router.message(F.text == "⭐ Наши отзывы")
+async def open_reviews_menu(msg: Message):
+    await msg.answer(
+        "⭐ Раздел отзывов\n\n"
+        "Здесь вы можете оставить свой отзыв о нашем магазине или прочитать отзывы других покупателей.",
+        reply_markup=kb.get_reviews_menu_kb()
+    )
 
 
 @main_router.message(F.text == "ℹ️ О магазине")
@@ -188,6 +205,122 @@ async def go_main_menu(cb: CallbackQuery):
     await cb.answer()
 
 
+@main_router.callback_query(F.data == "reviews_menu")
+async def go_reviews_menu(cb: CallbackQuery):
+    await cb.message.edit_text(
+        "⭐ Раздел отзывов\n\n"
+        "Здесь вы можете оставить свой отзыв о нашем магазине или прочитать отзывы других покупателей.",
+        reply_markup=kb.get_reviews_menu_kb()
+    )
+    await cb.answer()
+
+
+# ===== ОТЗЫВЫ =====
+
+@main_router.callback_query(F.data == "review_create")
+async def start_create_review(cb: CallbackQuery, state: FSMContext):
+    await state.set_state(ReviewSteps.step_comment)
+    await cb.message.answer("✍️ Напишите ваш отзыв:")
+    await cb.answer()
+
+
+@main_router.callback_query(F.data == "review_list")
+async def show_reviews_list(cb: CallbackQuery):
+    try:
+        reviews = await api_client.api.fetch_all_reviews()
+    except Exception as err:
+        logging.error(f"Ошибка при загрузке отзывов: {err}")
+        await cb.message.edit_text("Не удалось загрузить отзывы.", reply_markup=kb.get_back_to_reviews_kb())
+        await cb.answer()
+        return
+
+    if not reviews:
+        await cb.message.edit_text(
+            "Пока нет ни одного отзыва.\n\nБудьте первым, кто оставит отзыв!",
+            reply_markup=kb.get_back_to_reviews_kb()
+        )
+        await cb.answer()
+        return
+
+    output = ["⭐ Отзывы наших покупателей:\n"]
+    for review in reviews:
+        stars = "⭐" * review['rating']
+        author = review.get('username') or review.get('first_name') or 'Аноним'
+        output.append(
+            f"👤 {author}\n"
+            f"{stars}\n"
+            f"💬 {review['comment']}\n"
+            f"{'─' * 20}"
+        )
+
+    full_text = "\n".join(output)
+    if len(full_text) > 4000:
+        await cb.message.edit_text(output[0], reply_markup=kb.get_back_to_reviews_kb())
+        for i in range(1, len(output)):
+            if i < len(output) - 1:
+                await cb.message.answer(output[i])
+            else:
+                await cb.message.answer(output[i], reply_markup=kb.get_back_to_reviews_kb())
+    else:
+        await cb.message.edit_text(full_text, reply_markup=kb.get_back_to_reviews_kb())
+
+    await cb.answer()
+
+
+@main_router.message(ReviewSteps.step_comment)
+async def input_review_comment(msg: Message, state: FSMContext):
+    comment = msg.text.strip()
+    if len(comment) < 5:
+        await msg.answer("Отзыв слишком короткий. Пожалуйста, напишите хотя бы 5 символов.")
+        return
+
+    await state.update_data(review_comment=comment)
+    await state.set_state(ReviewSteps.step_rating)
+    await msg.answer(
+        "Отлично! Теперь поставьте оценку от 1 до 5 звёзд:",
+        reply_markup=kb.get_rating_kb()
+    )
+
+
+@main_router.callback_query(ReviewSteps.step_rating, F.data.startswith("rating_"))
+async def input_review_rating(cb: CallbackQuery, state: FSMContext):
+    rating = int(cb.data.split("_")[1])
+    user_data = await state.get_data()
+
+    try:
+        await api_client.api.create_review(
+            telegram_id=cb.from_user.id,
+            comment=user_data['review_comment'],
+            rating=rating
+        )
+    except Exception as err:
+        logging.error(f"Ошибка при создании отзыва: {err}")
+        await cb.message.answer("Не удалось сохранить отзыв. Попробуйте позже.", reply_markup=kb.get_reviews_menu_kb())
+        await state.clear()
+        await cb.answer()
+        return
+
+    await state.clear()
+    stars = "⭐" * rating
+    await cb.message.answer(
+        f"🎉 Спасибо за ваш отзыв!\n\n"
+        f"{stars}\n"
+        f"Ваше мнение очень важно для нас.",
+        reply_markup=kb.get_main_reply_kb()
+    )
+    await cb.answer()
+
+
+@main_router.callback_query(F.data == "review_cancel")
+async def cancel_review_creation(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text(
+        "Создание отзыва отменено.",
+        reply_markup=kb.get_reviews_menu_kb()
+    )
+    await cb.answer()
+
+
 @main_router.callback_query(F.data.startswith("cat_"))
 async def view_category_items(cb: CallbackQuery):
     cat_id = int(cb.data.split("_")[1])
@@ -206,7 +339,8 @@ async def view_category_items(cb: CallbackQuery):
         await cb.answer()
         return
 
-    await cb.message.edit_text(f"Раздел: {cat_title}\n\nКакой товар посмотреть?", reply_markup=kb.build_products_inline_kb(items))
+    await cb.message.edit_text(f"Раздел: {cat_title}\n\nКакой товар посмотреть?",
+                               reply_markup=kb.build_products_inline_kb(items))
     await cb.answer()
 
 
@@ -246,22 +380,22 @@ async def empty_the_basket(cb: CallbackQuery):
 
 
 @main_router.callback_query(F.data == "checkout_init")
-async def start_checkout_process(cb: CallbackQuery, fsm: FSMContext):
+async def start_checkout_process(cb: CallbackQuery, state: FSMContext):
     if UserBasket.is_empty(cb.from_user.id):
         await cb.answer("Сначала добавьте что-нибудь в корзину!", show_alert=True)
         return
 
-    await fsm.set_state(CheckoutSteps.step_name)
+    await state.set_state(CheckoutSteps.step_name)
     await cb.message.answer("Пожалуйста, укажите ФИО или имя получателя:")
     await cb.answer()
 
 
 @main_router.callback_query(F.data == "checkout_confirm")
-async def finalize_checkout(cb: CallbackQuery, fsm: FSMContext):
-    user_data = await fsm.get_data()
+async def finalize_checkout(cb: CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
     if UserBasket.is_empty(cb.from_user.id):
         await cb.answer("Корзина пуста, оформлять нечего.", show_alert=True)
-        await fsm.clear()
+        await state.clear()
         return
 
     order_payload = [
@@ -280,11 +414,11 @@ async def finalize_checkout(cb: CallbackQuery, fsm: FSMContext):
     except Exception as err:
         logging.error(f"Сбой при создании заказа: {err}")
         await cb.message.answer("Что-то пошло не так при оформлении. Попробуйте повторить позже.")
-        await fsm.clear()
+        await state.clear()
         return
 
     UserBasket.clear(cb.from_user.id)
-    await fsm.clear()
+    await state.clear()
 
     await cb.message.answer(
         f"🎉 Ура! Заказ #{new_order['id']} успешно принят!\n"
@@ -296,30 +430,30 @@ async def finalize_checkout(cb: CallbackQuery, fsm: FSMContext):
 
 
 @main_router.callback_query(F.data == "checkout_cancel")
-async def abort_checkout(cb: CallbackQuery, fsm: FSMContext):
-    await fsm.clear()
+async def abort_checkout(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     await cb.message.answer("Оформление прервано. Вы возвращены в главное меню.", reply_markup=kb.get_main_reply_kb())
     await cb.answer()
 
 
 @main_router.message(CheckoutSteps.step_name)
-async def input_customer_name(msg: Message, fsm: FSMContext):
-    await fsm.update_data(c_name=msg.text.strip())
-    await fsm.set_state(CheckoutSteps.step_phone)
+async def input_customer_name(msg: Message, state: FSMContext):
+    await state.update_data(c_name=msg.text.strip())
+    await state.set_state(CheckoutSteps.step_phone)
     await msg.answer("Теперь оставьте контактный номер телефона:")
 
 
 @main_router.message(CheckoutSteps.step_phone)
-async def input_customer_phone(msg: Message, fsm: FSMContext):
-    await fsm.update_data(c_phone=msg.text.strip())
-    await fsm.set_state(CheckoutSteps.step_address)
+async def input_customer_phone(msg: Message, state: FSMContext):
+    await state.update_data(c_phone=msg.text.strip())
+    await state.set_state(CheckoutSteps.step_address)
     await msg.answer("И последний шаг — укажите адрес доставки:")
 
 
 @main_router.message(CheckoutSteps.step_address)
-async def input_customer_address(msg: Message, fsm: FSMContext):
-    await fsm.update_data(c_address=msg.text.strip())
-    collected_data = await fsm.get_data()
+async def input_customer_address(msg: Message, state: FSMContext):
+    await state.update_data(c_address=msg.text.strip())
+    collected_data = await state.get_data()
 
     summary_text, _ = await generate_cart_summary(msg.from_user.id)
 

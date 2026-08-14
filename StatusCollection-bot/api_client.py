@@ -45,7 +45,7 @@ class ApiClient:
     async def fetch_user_orders(self, telegram_id: int):
         return await self._request("GET", "/api/orders", params={"telegram_id": telegram_id})
 
-    async def add_new_product(self, category_id, name, price, color=None, material=None, description=None, image_url=None):
+    async def add_new_product(self, category_id, name, price, color=None, material=None, description=None, country=None, image_url=None):
         payload = {
             "category_id": category_id,
             "name": name,
@@ -53,6 +53,7 @@ class ApiClient:
             "color": color,
             "material": material,
             "description": description,
+            "country": country,
             "image_url": image_url,
             "is_available": True,
         }
