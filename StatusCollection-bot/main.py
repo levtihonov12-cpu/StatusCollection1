@@ -1,401 +1,351 @@
 import asyncio
 import logging
 
-
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import CommandStart
-from admin_handlers import router as admin_router
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
-
 
 from config import BOT_TOKEN
 import api_client
 import keyboards as kb
 
-
 logging.basicConfig(level=logging.INFO)
 
-fallback_router = Router()
+main_router = Router()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+from admin_handlers import router as admin_router
 dp.include_router(admin_router)
-dp.include_router(fallback_router)
+dp.include_router(main_router)
 
-
-
-carts = {}
-
-STATUS_RU = {
+RUSSIAN_STATUSES = {
     "new": "Новый",
     "processing": "В обработке",
     "completed": "Завершён",
     "cancelled": "Отменён",
 }
 
+class UserBasket:
+    _baskets = {}
 
-class OrderStates(StatesGroup):
-    waiting_name = State()
-    waiting_phone = State()
-    waiting_address = State()
+    @classmethod
+    def get(cls, user_id: int) -> dict:
+        return cls._baskets.setdefault(user_id, {})
+
+    @classmethod
+    def add_item(cls, user_id: int, product_id: int):
+        basket = cls.get(user_id)
+        basket[product_id] = basket.get(product_id, 0) + 1
+
+    @classmethod
+    def clear(cls, user_id: int):
+        cls._baskets.pop(user_id, None)
+
+    @classmethod
+    def is_empty(cls, user_id: int) -> bool:
+        return not cls._baskets.get(user_id)
 
 
-def get_cart(user_id: int):
-    return carts.setdefault(user_id, {})
+class CheckoutSteps(StatesGroup):
+    step_name = State()
+    step_phone = State()
+    step_address = State()
 
 
-def add_to_cart(user_id: int, product_id: int):
-    cart = get_cart(user_id)
-    cart[product_id] = cart.get(product_id, 0) + 1
+async def generate_cart_summary(user_id: int) -> tuple[str, int]:
+    basket = UserBasket.get(user_id)
+    if not basket:
+        return "Ваша корзина пока пуста.", 0
 
+    text_lines = []
+    overall_price = 0
 
-def clear_cart(user_id: int):
-    carts.pop(user_id, None)
-
-
-async def get_cart_text(user_id: int):
-    cart = get_cart(user_id)
-
-    if not cart:
-        return "Корзина пустая."
-
-    lines = []
-    total = 0
-
-    for product_id, quantity in cart.items():
+    for prod_id, qty in basket.items():
         try:
-            product = await api_client.get_product(product_id)
+            prod = await api_client.api.fetch_product_details(prod_id)
         except Exception:
             continue
 
-        total += product["price"] * quantity
-        lines.append(f"{product['name']} — {product['price']} ₽ × {quantity}")
+        item_total = prod["price"] * qty
+        overall_price += item_total
+        text_lines.append(f"• {prod['name']} — {prod['price']} ₽ × {qty}")
 
-    lines.append("")
-    lines.append(f"Итого: {total} ₽")
-
-    return "\n".join(lines)
+    text_lines.append(f"\nИтоговая сумма: {overall_price} ₽")
+    return "\n".join(text_lines), overall_price
 
 
-def format_product(product: dict):
+def make_product_card(prod: dict) -> str:
     return (
-        f"{product['name']}\n\n"
-        f"Цена: {product['price']} ₽\n"
-        f"Цвет: {product.get('color') }\n"
-        f"Материал: {product.get('material') }\n\n"
-        f"{product.get('description') or 'Описание отсутствует'}"
+        f"👕 {prod['name']}\n\n"
+        f"💰 Стоимость: {prod['price']} ₽\n"
+        f"🎨 Цвет: {prod.get('color', 'не указан')}\n"
+        f"🧵 Материал: {prod.get('material', 'не указан')}\n\n"
+        f"📝 {prod.get('description') or 'Описание к этому товару отсутствует.'}"
     )
 
 
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
+@main_router.message(CommandStart())
+async def handle_start(msg: Message):
     try:
-        await api_client.register_user(
-            telegram_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-            last_name=message.from_user.last_name,
+        await api_client.api.register_telegram_user(
+            telegram_id=msg.from_user.id,
+            username=msg.from_user.username,
+            first_name=msg.from_user.first_name,
+            last_name=msg.from_user.last_name,
         )
-    except Exception as e:
-        logging.error(f"Не удалось зарегистрировать пользователя: {e}")
+    except Exception as err:
+        logging.error(f"Ошибка регистрации юзера {msg.from_user.id}: {err}")
 
-    await message.answer(
-        "Hello world! вы попали в магазин одежды Status Collection.\n"
-        "Выбери раздел:",
-        reply_markup=kb.main_menu_kb(),
+    await msg.answer(
+        "Привет! Добро пожаловать в бутик Status Collection 👔\n"
+        "Выберите нужный раздел в меню ниже:",
+        reply_markup=kb.get_main_reply_kb(),
     )
 
 
-@dp.message(F.text == "/cancel")
-async def cancel_state(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "Действие отменено.",
-        reply_markup=kb.main_menu_kb(),
-    )
+@main_router.message(Command("cancel"))
+async def handle_cancel(msg: Message, fsm: FSMContext):
+    await fsm.clear()
+    await msg.answer("Все текущие действия сброшены.", reply_markup=kb.get_main_reply_kb())
 
 
-@dp.message(F.text == "👔 Каталог")
-async def show_catalog(message: Message):
+@main_router.message(F.text == "👔 Каталог")
+async def open_catalog(msg: Message):
     try:
-        categories = await api_client.get_categories()
-    except Exception as e:
-        logging.error(f"Ошибка загрузки категорий: {e}")
-        await message.answer("Не удалось загрузить каталог. Проверь, что бэкенд запущен.")
+        cats = await api_client.api.fetch_categories()
+    except Exception as err:
+        logging.error(f"Проблема с получением категорий: {err}")
+        await msg.answer("Сейчас не получается загрузить каталог. Убедитесь, что сервер работает.")
         return
 
-    await message.answer(
-        "Выбери категорию:",
-        reply_markup=kb.categories_kb(categories),
-    )
+    await msg.answer("Пожалуйста, выберите интересующую категорию:", reply_markup=kb.build_categories_inline_kb(cats))
 
 
-@dp.message(F.text == "🛒 Корзина")
-async def show_cart(message: Message):
-    cart = get_cart(message.from_user.id)
-    text = await get_cart_text(message.from_user.id)
-
-    await message.answer(
-        text,
-        reply_markup=kb.cart_kb(is_empty=len(cart) == 0),
-    )
+@main_router.message(F.text == "🛒 Корзина")
+async def open_basket(msg: Message):
+    empty = UserBasket.is_empty(msg.from_user.id)
+    summary, _ = await generate_cart_summary(msg.from_user.id)
+    await msg.answer(summary, reply_markup=kb.get_cart_actions_kb(is_empty=empty))
 
 
-@dp.message(F.text == "📦 Мои заказы")
-async def show_orders(message: Message):
+@main_router.message(F.text == "📦 Мои заказы")
+async def show_user_orders(msg: Message):
     try:
-        orders = await api_client.get_orders(message.from_user.id)
-    except Exception as e:
-        logging.error(f"Ошибка загрузки заказов: {e}")
-        await message.answer("Не удалось загрузить заказы.")
+        orders_list = await api_client.api.fetch_user_orders(msg.from_user.id)
+    except Exception as err:
+        logging.error(f"Не удалось подтянуть заказы: {err}")
+        await msg.answer("Произошла ошибка при загрузке истории заказов.")
         return
 
-    if not orders:
-        await message.answer("У тебя пока нет заказов.")
+    if not orders_list:
+        await msg.answer("Вы еще ничего не заказывали.")
         return
 
-    lines = []
-
-    for order in orders:
-        status = STATUS_RU.get(order["status"], order["status"])
-        lines.append(
-            f"Заказ #{order['id']}\n"
-            f"Статус: {status}\n"
-            f"Сумма: {order['total_price']} ₽\n"
-            f"Товаров: {len(order['items'])}\n"
+    output = ["Ваши последние заказы:\n"]
+    for order in orders_list:
+        st = RUSSIAN_STATUSES.get(order["status"], order["status"])
+        output.append(
+            f"🧾 Заказ #{order['id']}\n"
+            f"Статус: {st}\n"
+            f"К оплате: {order['total_price']} ₽\n"
+            f"Позиций в заказе: {len(order['items'])}\n"
+            f"{'-'*20}"
         )
 
-    await message.answer("Твои заказы:\n\n" + "\n".join(lines))
+    await msg.answer("\n".join(output))
 
 
-@dp.message(F.text == "ℹ️ О магазине")
-async def about(message: Message):
-    await message.answer(
-        "премиум одежда от Status Collection в Telegram.\n"
-        "Здесь можно посмотреть самые лучшие вещи которые идеально подобранны под каждого и оформить заказ."
+@main_router.message(F.text == "ℹ️ О магазине")
+async def shop_info(msg: Message):
+    await msg.answer(
+        "Status Collection — это премиальный магазин одежды прямо в Telegram.\n"
+        "У нас собраны лучшие вещи, которые мы с удовольствием поможем вам подобрать и доставить."
     )
 
 
-@dp.callback_query(F.data == "catalog")
-async def cb_catalog(callback: CallbackQuery):
+@main_router.callback_query(F.data == "nav_catalog")
+async def go_catalog(cb: CallbackQuery):
     try:
-        categories = await api_client.get_categories()
-    except Exception as e:
-        logging.error(f"Ошибка загрузки категорий: {e}")
-        await callback.message.edit_text("Не удалось загрузить каталог.")
-        await callback.answer()
+        cats = await api_client.api.fetch_categories()
+    except Exception as err:
+        logging.error(f"Ошибка загрузки каталога: {err}")
+        await cb.message.edit_text("Каталог сейчас недоступен.")
+        await cb.answer()
         return
 
-    await callback.message.edit_text(
-        "Выбери категорию:",
-        reply_markup=kb.categories_kb(categories),
-    )
-    await callback.answer()
+    await cb.message.edit_text("Выберите категорию вещей:", reply_markup=kb.build_categories_inline_kb(cats))
+    await cb.answer()
 
 
-@dp.callback_query(F.data == "menu:main")
-async def cb_main_menu(callback: CallbackQuery):
-    await callback.message.answer(
-        "Главное меню:",
-        reply_markup=kb.main_menu_kb(),
-    )
-    await callback.answer()
+@main_router.callback_query(F.data == "nav_main")
+async def go_main_menu(cb: CallbackQuery):
+    await cb.message.answer("Возвращаемся в главное меню:", reply_markup=kb.get_main_reply_kb())
+    await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("cat:"))
-async def cb_category(callback: CallbackQuery):
-    category_id = int(callback.data.split(":")[1])
-
+@main_router.callback_query(F.data.startswith("cat_"))
+async def view_category_items(cb: CallbackQuery):
+    cat_id = int(cb.data.split("_")[1])
     try:
-        products = await api_client.get_products(category_id=category_id)
-        categories = await api_client.get_categories()
-        category_name = next(
-            (c["name"] for c in categories if c["id"] == category_id),
-            "Категория"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка загрузки товаров: {e}")
-        await callback.message.edit_text("Не удалось загрузить товары.")
-        await callback.answer()
+        items = await api_client.api.fetch_products(category_id=cat_id)
+        all_cats = await api_client.api.fetch_categories()
+        cat_title = next((c["name"] for c in all_cats if c["id"] == cat_id), "Неизвестная категория")
+    except Exception as err:
+        logging.error(f"Ошибка при получении товаров: {err}")
+        await cb.message.edit_text("Товары сейчас недоступны.")
+        await cb.answer()
         return
 
-    if not products:
-        await callback.message.edit_text(
-            f"В категории «{category_name}» пока нет товаров.",
-            reply_markup=kb.back_to_catalog_kb(),
-        )
-        await callback.answer()
+    if not items:
+        await cb.message.edit_text(f"В разделе «{cat_title}» пока пустота.", reply_markup=kb.get_back_to_catalog_kb())
+        await cb.answer()
         return
 
-    await callback.message.edit_text(
-        f"Категория: {category_name}\nВыбери товар:",
-        reply_markup=kb.products_kb(products),
-    )
-    await callback.answer()
+    await cb.message.edit_text(f"Раздел: {cat_title}\n\nКакой товар посмотреть?", reply_markup=kb.build_products_inline_kb(items))
+    await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("prod:"))
-async def cb_product(callback: CallbackQuery):
-    product_id = int(callback.data.split(":")[1])
-
+@main_router.callback_query(F.data.startswith("prod_"))
+async def view_product_details(cb: CallbackQuery):
+    prod_id = int(cb.data.split("_")[1])
     try:
-        product = await api_client.get_product(product_id)
-    except Exception as e:
-        logging.error(f"Ошибка загрузки товара: {e}")
-        await callback.message.edit_text("Не удалось загрузить товар.")
-        await callback.answer()
+        prod = await api_client.api.fetch_product_details(prod_id)
+    except Exception as err:
+        logging.error(f"Не удалось получить информацию о товаре: {err}")
+        await cb.message.edit_text("Информация о товаре сейчас недоступна.")
+        await cb.answer()
         return
-    if product.get("image_url"):
+
+    if prod.get("image_url"):
         try:
-            await callback.message.answer_photo(product["image_url"])
-        except Exception as e:
-            logging.error(f"Не удалось отправить фото: {e}")
-    await callback.message.edit_text(
-        format_product(product),
-        reply_markup=kb.product_kb(product_id),
-    )
-    await callback.answer()
+            await cb.message.answer_photo(prod["image_url"])
+        except Exception as err:
+            logging.error(f"Не получилось отправить картинку товара: {err}")
+
+    await cb.message.edit_text(make_product_card(prod), reply_markup=kb.get_product_details_kb(prod_id))
+    await cb.answer()
 
 
-@dp.callback_query(F.data.startswith("add:"))
-async def cb_add_to_cart(callback: CallbackQuery):
-    product_id = int(callback.data.split(":")[1])
-    add_to_cart(callback.from_user.id, product_id)
-    await callback.answer("Товар добавлен в корзину", show_alert=True)
+@main_router.callback_query(F.data.startswith("basket_add_"))
+async def add_item_to_cart(cb: CallbackQuery):
+    prod_id = int(cb.data.split("_")[2])
+    UserBasket.add_item(cb.from_user.id, prod_id)
+    await cb.answer("Отличный выбор! Товар перемещен в корзину.", show_alert=True)
 
 
-@dp.callback_query(F.data == "cart:clear")
-async def cb_clear_cart(callback: CallbackQuery):
-    clear_cart(callback.from_user.id)
-    await callback.message.edit_text(
-        "Корзина очищена.",
-        reply_markup=kb.cart_kb(is_empty=True),
-    )
-    await callback.answer()
+@main_router.callback_query(F.data == "basket_clear")
+async def empty_the_basket(cb: CallbackQuery):
+    UserBasket.clear(cb.from_user.id)
+    await cb.message.edit_text("Вы полностью очистили корзину.", reply_markup=kb.get_cart_actions_kb(is_empty=True))
+    await cb.answer()
 
 
-@dp.callback_query(F.data == "order:start")
-async def cb_order_start(callback: CallbackQuery, state: FSMContext):
-    cart = get_cart(callback.from_user.id)
-
-    if not cart:
-        await callback.answer("Корзина пустая", show_alert=True)
+@main_router.callback_query(F.data == "checkout_init")
+async def start_checkout_process(cb: CallbackQuery, fsm: FSMContext):
+    if UserBasket.is_empty(cb.from_user.id):
+        await cb.answer("Сначала добавьте что-нибудь в корзину!", show_alert=True)
         return
 
-    await state.set_state(OrderStates.waiting_name)
-    await callback.message.answer("Введи имя получателя:")
-    await callback.answer()
+    await fsm.set_state(CheckoutSteps.step_name)
+    await cb.message.answer("Пожалуйста, укажите ФИО или имя получателя:")
+    await cb.answer()
 
 
-@dp.callback_query(F.data == "order:confirm")
-async def cb_order_confirm(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    cart = get_cart(callback.from_user.id)
-
-    if not cart:
-        await callback.answer("Корзина пустая", show_alert=True)
-        await state.clear()
+@main_router.callback_query(F.data == "checkout_confirm")
+async def finalize_checkout(cb: CallbackQuery, fsm: FSMContext):
+    user_data = await fsm.get_data()
+    if UserBasket.is_empty(cb.from_user.id):
+        await cb.answer("Корзина пуста, оформлять нечего.", show_alert=True)
+        await fsm.clear()
         return
 
-    items = [
-        {"product_id": product_id, "quantity": quantity}
-        for product_id, quantity in cart.items()
+    order_payload = [
+        {"product_id": p_id, "quantity": qty}
+        for p_id, qty in UserBasket.get(cb.from_user.id).items()
     ]
 
     try:
-        order = await api_client.create_order(
-            telegram_id=callback.from_user.id,
-            customer_name=data.get("customer_name", ""),
-            phone=data.get("phone", ""),
-            address=data.get("address", ""),
-            items=items,
+        new_order = await api_client.api.create_new_order(
+            telegram_id=cb.from_user.id,
+            customer_name=user_data.get("c_name", ""),
+            phone=user_data.get("c_phone", ""),
+            address=user_data.get("c_address", ""),
+            items=order_payload,
         )
-    except Exception as e:
-        logging.error(f"Ошибка создания заказа: {e}")
-        await callback.message.answer("Не удалось оформить заказ. Попробуй ещё раз.")
-        await state.clear()
+    except Exception as err:
+        logging.error(f"Сбой при создании заказа: {err}")
+        await cb.message.answer("Что-то пошло не так при оформлении. Попробуйте повторить позже.")
+        await fsm.clear()
         return
 
-    clear_cart(callback.from_user.id)
-    await state.clear()
+    UserBasket.clear(cb.from_user.id)
+    await fsm.clear()
 
-    await callback.message.answer(
-        f"✅ Заказ #{order['id']} оформлен!\n"
-        f"Сумма: {order['total_price']} ₽\n"
-        "Мы свяжемся с тобой для подтверждения.",
-        reply_markup=kb.main_menu_kb(),
+    await cb.message.answer(
+        f"🎉 Ура! Заказ #{new_order['id']} успешно принят!\n"
+        f"Итог: {new_order['total_price']} ₽\n"
+        "Наш менеджер скоро свяжется с вами для уточнения деталей.",
+        reply_markup=kb.get_main_reply_kb(),
     )
-    await callback.answer()
+    await cb.answer()
 
 
-@dp.callback_query(F.data == "order:cancel")
-async def cb_order_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer(
-        "Заказ отменён.",
-        reply_markup=kb.main_menu_kb(),
-    )
-    await callback.answer()
+@main_router.callback_query(F.data == "checkout_cancel")
+async def abort_checkout(cb: CallbackQuery, fsm: FSMContext):
+    await fsm.clear()
+    await cb.message.answer("Оформление прервано. Вы возвращены в главное меню.", reply_markup=kb.get_main_reply_kb())
+    await cb.answer()
 
 
-@dp.message(OrderStates.waiting_name)
-async def process_name(message: Message, state: FSMContext):
-    await state.update_data(customer_name=message.text.strip())
-    await state.set_state(OrderStates.waiting_phone)
-    await message.answer("Введи номер телефона:")
+@main_router.message(CheckoutSteps.step_name)
+async def input_customer_name(msg: Message, fsm: FSMContext):
+    await fsm.update_data(c_name=msg.text.strip())
+    await fsm.set_state(CheckoutSteps.step_phone)
+    await msg.answer("Теперь оставьте контактный номер телефона:")
 
 
-@dp.message(OrderStates.waiting_phone)
-async def process_phone(message: Message, state: FSMContext):
-    await state.update_data(phone=message.text.strip())
-    await state.set_state(OrderStates.waiting_address)
-    await message.answer("Введи адрес доставки:")
+@main_router.message(CheckoutSteps.step_phone)
+async def input_customer_phone(msg: Message, fsm: FSMContext):
+    await fsm.update_data(c_phone=msg.text.strip())
+    await fsm.set_state(CheckoutSteps.step_address)
+    await msg.answer("И последний шаг — укажите адрес доставки:")
 
 
-@dp.message(OrderStates.waiting_address)
-async def process_address(message: Message, state: FSMContext):
-    await state.update_data(address=message.text.strip())
-    data = await state.get_data()
+@main_router.message(CheckoutSteps.step_address)
+async def input_customer_address(msg: Message, fsm: FSMContext):
+    await fsm.update_data(c_address=msg.text.strip())
+    collected_data = await fsm.get_data()
 
-    cart = get_cart(message.from_user.id)
+    summary_text, _ = await generate_cart_summary(msg.from_user.id)
 
-    lines = []
-    total = 0
-
-    for product_id, quantity in cart.items():
-        try:
-            product = await api_client.get_product(product_id)
-        except Exception:
-            continue
-
-        total += product["price"] * quantity
-        lines.append(f"{product['name']} — {product['price']} ₽ × {quantity}")
-
-    text = (
-        "Проверь заказ:\n\n"
-        + "\n".join(lines)
-        + f"\n\nИтого: {total} ₽\n\n"
-        f"Имя: {data['customer_name']}\n"
-        f"Телефон: {data['phone']}\n"
-        f"Адрес: {data['address']}\n\n"
-        "Подтвердить заказ?"
+    final_check = (
+        "Давайте проверим данные перед отправкой:\n\n"
+        f"{summary_text}\n\n"
+        f"👤 Получатель: {collected_data['c_name']}\n"
+        f"📞 Телефон: {collected_data['c_phone']}\n"
+        f"📍 Куда доставить: {collected_data['c_address']}\n\n"
+        "Всё верно и отправляем?"
     )
 
-    await message.answer(text, reply_markup=kb.confirm_order_kb())
+    await msg.answer(final_check, reply_markup=kb.get_order_confirmation_kb())
 
 
-@fallback_router.message()
-async def unknown(message: Message):
-    await message.answer(
-        "Я пока понимаю только кнопки меню.",
-        reply_markup=kb.main_menu_kb(),
+@main_router.message()
+async def fallback_handler(msg: Message):
+    await msg.answer(
+        "Я пока умею реагировать только на кнопки внизу экрана или в меню.",
+        reply_markup=kb.get_main_reply_kb(),
     )
 
-async def main():
+
+async def launch_bot():
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(launch_bot())

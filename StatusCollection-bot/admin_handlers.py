@@ -6,13 +6,13 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-from config import ADMIN_IDS
+from config import ADMINS
 import api_client
 import keyboards as kb
 
 router = Router()
 
-STATUS_RU = {
+STATUS_TRANSLATION = {
     "new": "Новый",
     "processing": "В обработке",
     "completed": "Завершён",
@@ -20,254 +20,283 @@ STATUS_RU = {
 }
 
 
-class AddProductStates(StatesGroup):
-    waiting_name = State()
-    waiting_price = State()
-    waiting_color = State()
-    waiting_material = State()
-    waiting_description = State()
-    waiting_image = State()
+class ProductCreationSteps(StatesGroup):
+    ask_name = State()
+    ask_price = State()
+    ask_color = State()
+    ask_material = State()
+    ask_desc = State()
+    ask_photo = State()
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def has_admin_rights(user_id: int) -> bool:
+    return user_id in ADMINS
 
 
 @router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено.")
+async def stop_admin_action(msg: Message, fsm: FSMContext):
+    await fsm.clear()
+    await msg.answer("Текущее действие отменено.")
 
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("Доступ запрещён.")
+async def open_admin_panel(msg: Message):
+    if not has_admin_rights(msg.from_user.id):
+        await msg.answer("У вас нет прав для доступа к этому разделу.")
         return
-    await message.answer("Админ-панель:", reply_markup=kb.admin_menu_kb())
+    await msg.answer("Добро пожаловать в панель управления 👑", reply_markup=kb.get_admin_panel_kb())
 
 
-@router.callback_query(F.data == "admin:menu")
-async def cb_admin_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data == "adm_menu")
+async def return_to_admin_menu(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Доступ закрыт.", show_alert=True)
         return
-    await callback.message.edit_text("Админ-панель:", reply_markup=kb.admin_menu_kb())
-    await callback.answer()
+    await cb.message.edit_text("Панель управления 👑", reply_markup=kb.get_admin_panel_kb())
+    await cb.answer()
 
 
-@router.callback_query(F.data == "admin:close")
-async def cb_admin_close(callback: CallbackQuery):
-    await callback.message.edit_text("Админ-панель закрыта.")
-    await callback.answer()
+@router.callback_query(F.data == "adm_hide")
+async def close_admin_panel(cb: CallbackQuery):
+    await cb.message.edit_text("Админ-панель свернута.")
+    await cb.answer()
 
-@router.callback_query(F.data == "admin:orders")
-async def cb_admin_orders(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+
+@router.callback_query(F.data == "adm_orders")
+async def list_all_orders(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
     try:
-        orders = await api_client.get_all_orders()
-    except Exception as e:
-        logging.error(f"Ошибка загрузки заказов: {e}")
-        await callback.message.edit_text("Не удалось загрузить заказы.")
-        await callback.answer()
+        all_orders = await api_client.api.fetch_all_orders()
+    except Exception as err:
+        logging.error(f"Сбой при выгрузке заказов: {err}")
+        await cb.message.edit_text("Не получилось подгрузить заказы.")
+        await cb.answer()
         return
-    if not orders:
-        await callback.message.edit_text("Заказов пока нет.", reply_markup=kb.admin_menu_kb())
-        await callback.answer()
+
+    if not all_orders:
+        await cb.message.edit_text("В базе пока нет ни одного заказа.", reply_markup=kb.get_admin_panel_kb())
+        await cb.answer()
         return
-    await callback.message.edit_text("Все заказы:", reply_markup=kb.admin_orders_kb(orders))
-    await callback.answer()
+
+    await cb.message.edit_text("Список всех актуальных заказов:", reply_markup=kb.get_admin_orders_kb(all_orders))
+    await cb.answer()
 
 
-async def render_order(message, order_id: int):
-    orders = await api_client.get_all_orders()
-    order = next((o for o in orders if o["id"] == order_id), None)
-    if order is None:
-        await message.edit_text("Заказ не найден.", reply_markup=kb.admin_menu_kb())
+async def display_order_details(target_msg, order_id: int):
+    try:
+        all_orders = await api_client.api.fetch_all_orders()
+    except Exception:
+        await target_msg.edit_text("Ошибка связи с сервером.")
         return
+
+    order = next((o for o in all_orders if o["id"] == order_id), None)
+    if not order:
+        await target_msg.edit_text("Такой заказ не найден.", reply_markup=kb.get_admin_panel_kb())
+        return
+
+    st_text = STATUS_TRANSLATION.get(order['status'], order['status'])
     lines = [
-        f"Заказ #{order['id']}",
-        f"Статус: {STATUS_RU.get(order['status'], order['status'])}",
-        f"Имя: {order['customer_name']}",
-        f"Сумма: {order['total_price']} ₽",
-        f"Телефон: {order['phone']}",
+        f"🧾 Детали заказа #{order['id']}",
+        f"Текущий статус: {st_text}",
+        f"Клиент: {order['customer_name']}",
+        f"Общая сумма: {order['total_price']} ₽",
+        f"Контакт: {order['phone']}",
         f"Адрес: {order['address']}",
         "",
-        "Состав заказа:",
+        "Что входит в заказ:"
     ]
+
     for item in order["items"]:
         try:
-            product = await api_client.get_product(item["product_id"])
-            name = product["name"]
+            prod = await api_client.api.fetch_product_details(item["product_id"])
+            item_name = prod["name"]
         except Exception:
-            name = f"Товар #{item['product_id']}"
-        lines.append(f"{name} — {item['price']} ₽ × {item['quantity']}")
-    await message.edit_text("\n".join(lines), reply_markup=kb.admin_order_kb(order_id))
+            item_name = f"Товар с ID {item['product_id']}"
+        lines.append(f"• {item_name} — {item['price']} ₽ × {item['quantity']}")
+
+    await target_msg.edit_text("\n".join(lines), reply_markup=kb.get_admin_order_actions_kb(order_id))
 
 
-@router.callback_query(F.data.startswith("admin:order:"))
-async def cb_admin_order(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data.startswith("adm_view_ord_"))
+async def show_specific_order(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    order_id = int(callback.data.split(":")[2])
-    await render_order(callback.message, order_id)
-    await callback.answer()
+    oid = int(cb.data.split("_")[3])
+    await display_order_details(cb.message, oid)
+    await cb.answer()
 
-@router.callback_query(F.data.startswith("admin:status:"))
-async def cb_admin_status(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+
+@router.callback_query(F.data.startswith("adm_set_status_"))
+async def update_order_current_status(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    parts = callback.data.split(":")
-    order_id = int(parts[2])
-    new_status = parts[3]
+
+    parts = cb.data.split("_")
+    oid = int(parts[3])
+    new_st = parts[4]
+
     try:
-        await api_client.update_order_status(order_id, new_status)
-    except Exception as e:
-        logging.error(f"Ошибка обновления статуса: {e}")
-        await callback.answer("Не удалось обновить статус", show_alert=True)
+        await api_client.api.change_order_status(oid, new_st)
+    except Exception as err:
+        logging.error(f"Не удалось поменять статус: {err}")
+        await cb.answer("Ошибка обновления статуса!", show_alert=True)
         return
-    await render_order(callback.message, order_id)
-    await callback.answer("Статус обновлён")
+
+    await display_order_details(cb.message, oid)
+    await cb.answer("Статус заказа успешно изменен.")
 
 
-@router.callback_query(F.data == "admin:delete_product")
-async def cb_admin_delete_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data == "adm_del_prod")
+async def show_products_to_delete(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    products = await api_client.get_products()
-    if not products:
-        await callback.message.edit_text("Товаров нет.", reply_markup=kb.admin_menu_kb())
-        await callback.answer()
+
+    try:
+        prods = await api_client.api.fetch_products()
+    except Exception as err:
+        logging.error(f"Ошибка получения списка товаров: {err}")
+        await cb.answer()
         return
-    await callback.message.edit_text(
-        "Выбери товар для удаления:",
-        reply_markup=kb.admin_delete_products_kb(products),
+
+    if not prods:
+        await cb.message.edit_text("В каталоге пока нет товаров.", reply_markup=kb.get_admin_panel_kb())
+        await cb.answer()
+        return
+
+    await cb.message.edit_text(
+        "Нажмите на товар, который нужно удалить из базы:",
+        reply_markup=kb.get_admin_delete_products_kb(prods),
     )
-    await callback.answer()
+    await cb.answer()
 
 
-@router.callback_query(F.data.startswith("admin:del:"))
-async def cb_admin_delete(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+@router.callback_query(F.data.startswith("adm_remove_prod_"))
+async def execute_product_deletion(cb: CallbackQuery):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    product_id = int(callback.data.split(":")[2])
+
+    pid = int(cb.data.split("_")[3])
     try:
-        await api_client.delete_product(product_id)
-    except Exception as e:
-        logging.error(f"Ошибка удаления товара: {e}")
-        await callback.answer("Не удалось удалить товар", show_alert=True)
+        await api_client.api.remove_product(pid)
+    except Exception as err:
+        logging.error(f"Сбой при удалении товара: {err}")
+        await cb.answer("Не получилось удалить товар", show_alert=True)
         return
-    products = await api_client.get_products()
-    if products:
-        await callback.message.edit_text(
-            "Товар удалён. Выбери следующий:",
-            reply_markup=kb.admin_delete_products_kb(products),
+
+    prods = await api_client.api.fetch_products()
+    if prods:
+        await cb.message.edit_text(
+            "Товар успешно стерт из базы. Выберите следующий:",
+            reply_markup=kb.get_admin_delete_products_kb(prods),
         )
     else:
-        await callback.message.edit_text("Товаров нет.", reply_markup=kb.admin_menu_kb())
-    await callback.answer("Товар удален")
+        await cb.message.edit_text("База товаров полностью очищена.", reply_markup=kb.get_admin_panel_kb())
+    await cb.answer("Готово, товар удален.")
 
-@router.callback_query(F.data == "admin:add_product")
-async def cb_admin_add(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+
+@router.callback_query(F.data == "adm_add_prod")
+async def start_new_product_flow(cb: CallbackQuery, fsm: FSMContext):
+    if not has_admin_rights(cb.from_user.id):
+        await cb.answer("Нет доступа", show_alert=True)
         return
-    categories = await api_client.get_categories()
-    await callback.message.edit_text(
-        "Выбери категорию для нового товара:",
-        reply_markup=kb.admin_categories_kb(categories),
+
+    cats = await api_client.api.fetch_categories()
+    await cb.message.edit_text(
+        "Сначала выберите категорию, к которой будет относиться новая вещь:",
+        reply_markup=kb.get_admin_categories_kb(cats),
     )
-    await callback.answer()
+    await cb.answer()
 
 
-@router.callback_query(F.data.startswith("admin:addcat:"))
-async def cb_admin_addcat(callback: CallbackQuery, state: FSMContext):
-    category_id = int(callback.data.split(":")[2])
-    await state.update_data(category_id=category_id)
-    await state.set_state(AddProductStates.waiting_name)
-    await callback.message.answer("Введи название товара:")
-    await callback.answer()
+@router.callback_query(F.data.startswith("adm_pick_cat_"))
+async def select_category_for_product(cb: CallbackQuery, fsm: FSMContext):
+    cid = int(cb.data.split("_")[3])
+    await fsm.update_data(category_id=cid)
+    await fsm.set_state(ProductCreationSteps.ask_name)
+    await cb.message.answer("Как назовем новый товар?")
+    await cb.answer()
 
 
-@router.message(AddProductStates.waiting_name)
-async def process_product_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text.strip())
-    await state.set_state(AddProductStates.waiting_price)
-    await message.answer("Введи цену (число, в рублях):")
+@router.message(ProductCreationSteps.ask_name)
+async def input_product_name(msg: Message, fsm: FSMContext):
+    await fsm.update_data(prod_name=msg.text.strip())
+    await fsm.set_state(ProductCreationSteps.ask_price)
+    await msg.answer("Теперь укажите стоимость (только цифры, в рублях):")
 
 
-@router.message(AddProductStates.waiting_price)
-async def process_product_price(message: Message, state: FSMContext):
+@router.message(ProductCreationSteps.ask_price)
+async def input_product_price(msg: Message, fsm: FSMContext):
     try:
-        price = int(message.text.strip())
+        val = int(msg.text.strip())
     except ValueError:
-        await message.answer("Цена должна быть числом. Например: 1499")
+        await msg.answer("Нужно ввести целое число. Попробуйте еще раз (например: 2500):")
         return
-    await state.update_data(price=price)
-    await state.set_state(AddProductStates.waiting_color)
-    await message.answer("Введи цвет одежды (или отправь -, если нет):")
+    await fsm.update_data(prod_price=val)
+    await fsm.set_state(ProductCreationSteps.ask_color)
+    await msg.answer("Какого цвета эта вещь? (Если не важно, просто отправьте '-')")
 
 
-@router.message(AddProductStates.waiting_color)
-async def process_product_color(message: Message, state: FSMContext):
-    color = message.text.strip()
-    await state.update_data(color=None if color == "-" else color)
-    await state.set_state(AddProductStates.waiting_material)
-    await message.answer("Введи материал одежды (или отправь -, если нет):")
+@router.message(ProductCreationSteps.ask_color)
+async def input_product_color(msg: Message, fsm: FSMContext):
+    c = msg.text.strip()
+    await fsm.update_data(prod_color=None if c == "-" else c)
+    await fsm.set_state(ProductCreationSteps.ask_material)
+    await msg.answer("Из какого материала сделано? (Или '-' если без разницы)")
 
 
-@router.message(AddProductStates.waiting_material)
-async def process_product_material(message: Message, state: FSMContext):
-    material = message.text.strip()
-    await state.update_data(material=None if material == "-" else material)
-    await state.set_state(AddProductStates.waiting_description)
-    await message.answer("Введи описание товара:")
+@router.message(ProductCreationSteps.ask_material)
+async def input_product_material(msg: Message, fsm: FSMContext):
+    m = msg.text.strip()
+    await fsm.update_data(prod_material=None if m == "-" else m)
+    await fsm.set_state(ProductCreationSteps.ask_desc)
+    await msg.answer("Напишите подробное описание для карточки товара:")
 
 
-@router.message(AddProductStates.waiting_description)
-async def process_product_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
-    await state.set_state(AddProductStates.waiting_image)
-    await message.answer("Пришли фото товара (или отправь -, если фото нет):")
-
-@router.message(AddProductStates.waiting_image, F.photo)
-async def process_product_image(message: Message, state: FSMContext):
-    file_id = message.photo[-1].file_id
-    await state.update_data(image_url=file_id)
-    await finish_add_product(message, state)
+@router.message(ProductCreationSteps.ask_desc)
+async def input_product_description(msg: Message, fsm: FSMContext):
+    await fsm.update_data(prod_desc=msg.text.strip())
+    await fsm.set_state(ProductCreationSteps.ask_photo)
+    await msg.answer("Отправьте фотографию товара. Если фото пока нет, отправьте '-'")
 
 
-@router.message(AddProductStates.waiting_image)
-async def process_product_no_image(message: Message, state: FSMContext):
-    await state.update_data(image_url=None)
-    await finish_add_product(message, state)
+@router.message(ProductCreationSteps.ask_photo, F.photo)
+async def save_product_photo(msg: Message, fsm: FSMContext):
+    file_uid = msg.photo[-1].file_id
+    await fsm.update_data(prod_img=file_uid)
+    await complete_product_addition(msg, fsm)
 
 
-async def finish_add_product(message: Message, state: FSMContext):
-    data = await state.get_data()
-    await state.clear()
+@router.message(ProductCreationSteps.ask_photo)
+async def skip_product_photo(msg: Message, fsm: FSMContext):
+    await fsm.update_data(prod_img=None)
+    await complete_product_addition(msg, fsm)
+
+
+async def complete_product_addition(msg: Message, fsm: FSMContext):
+    gathered = await fsm.get_data()
+    await fsm.clear()
     try:
-        product = await api_client.create_product(
-            category_id=data["category_id"],
-            name=data["name"],
-            price=data["price"],
-            color=data.get("color"),
-            material=data.get("material"),
-            description=data.get("description"),
-            image_url=data.get("image_url"),
+        new_prod = await api_client.api.add_new_product(
+            category_id=gathered["category_id"],
+            name=gathered["prod_name"],
+            price=gathered["prod_price"],
+            color=gathered.get("prod_color"),
+            material=gathered.get("prod_material"),
+            description=gathered.get("prod_desc"),
+            image_url=gathered.get("prod_img"),
         )
-    except Exception as e:
-        logging.error(f"Ошибка создания товара: {e}")
-        await message.answer("Не удалось добавить товар.")
+    except Exception as err:
+        logging.error(f"Ошибка при добавлении новой позиции: {err}")
+        await msg.answer("Не получилось сохранить товар в базе.")
         return
-    await message.answer(
-        f"✅ Товар «{product['name']}» добавлен (ID {product['id']}).",
-        reply_markup=kb.admin_menu_kb(),
+
+    await msg.answer(
+        f"🎉 Отлично! Вещь «{new_prod['name']}» успешно добавлена (Ее ID: {new_prod['id']}).",
+        reply_markup=kb.get_admin_panel_kb(),
     )
-    #metal gemstone
